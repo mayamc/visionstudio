@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { AppLayout, Sidebar, WorkflowDiagram, SpecEditor, TerminalPanel, DEFAULT_TERMINAL_HEIGHT, AddProjectModal } from './components'
 import { FindingsView } from './components/project/FindingsView'
+import { AgentPanel } from './components/agent/AgentPanel'
 import { api } from './services/api'
 import { useProjectEvents, FileEvent } from './hooks/useProjectEvents'
 import type { Project, Spec } from './types'
@@ -249,6 +250,13 @@ function App() {
         ) : (
           <EmptyState message="Select a project to get started" />
         )
+      }
+      agent={
+        <AgentPanel
+          project={activeProject}
+          activeSpec={activeSpec}
+          specContent={specContent}
+        />
       }
       terminal={
         <TerminalPanel

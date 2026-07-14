@@ -3,10 +3,11 @@ import { ReactNode } from 'react'
 interface AppLayoutProps {
   sidebar: ReactNode
   main: ReactNode
+  agent?: ReactNode
   terminal?: ReactNode
 }
 
-export function AppLayout({ sidebar, main, terminal }: AppLayoutProps) {
+export function AppLayout({ sidebar, main, agent, terminal }: AppLayoutProps) {
   return (
     <div className="flex h-screen w-screen overflow-hidden">
       {/* Left column: Sidebar */}
@@ -17,10 +18,17 @@ export function AppLayout({ sidebar, main, terminal }: AppLayoutProps) {
       </div>
 
       {/* Main content area */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         {/* Main panel */}
-        <div className="flex-1 overflow-hidden">
-          {main}
+        <div className="flex-1 overflow-hidden flex min-h-0">
+          <div className="flex-1 overflow-hidden">
+            {main}
+          </div>
+          {agent && (
+            <div className="flex-shrink-0 overflow-hidden">
+              {agent}
+            </div>
+          )}
         </div>
 
         {/* Terminal panel */}
