@@ -1,5 +1,6 @@
 .task
 bin
+daemon
 node_modules
 dist
 desktop/dist-main
