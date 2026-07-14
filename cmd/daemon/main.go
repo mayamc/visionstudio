@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -23,11 +24,13 @@ import (
 	"github.com/grokify/mogo/os/osutil"
 
 	specconfig "github.com/ProductBuildersHQ/visionspec/pkg/config"
+	visionspeceval "github.com/ProductBuildersHQ/visionspec/pkg/eval"
 	"github.com/ProductBuildersHQ/visionspec/pkg/lint"
 	"github.com/ProductBuildersHQ/visionspec/pkg/profiles"
 	"github.com/ProductBuildersHQ/visionspec/pkg/types"
 	"github.com/ProductBuildersHQ/visionspec/pkg/workflow"
 	"github.com/ProductBuildersHQ/visionspec/pkg/workflow/specworkflow"
+	omnillm "github.com/plexusone/omnillm-core"
 	"github.com/ProductBuildersHQ/visionstudio/pkg/api"
 	"github.com/ProductBuildersHQ/visionstudio/pkg/config"
 )
@@ -726,16 +729,126 @@ func (s *Server) handleEvaluateSpec(w http.ResponseWriter, r *http.Request) {
 	specType := chi.URLParam(r, "specType")
 	s.logger.Debug("Evaluating spec", "project", projectName, "type", specType)
 
-	// TODO: Integrate with visionspec evaluation
-	s.writeJSON(w, http.StatusOK, api.EvaluateSpecResponse{
-		Result: api.EvalResult{
-			Score:    7.5,
-			Decision: api.EvalDecisionPass,
-			Findings: []api.Finding{
-				{Category: "clarity", Severity: "medium", Message: "Consider adding more specific user personas"},
-			},
+	// Validate specType for path traversal
+	if err := osutil.ValidateNoTraversal(specType); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, api.EvaluateSpecResponse{Error: "Invalid spec type"})
+		return
+	}
+
+	// Get project from config
+	project, err := config.GetProject(projectName)
+	if err != nil {
+		s.writeJSON(w, http.StatusNotFound, api.EvaluateSpecResponse{Error: "Project not found"})
+		return
+	}
+
+	// Map spec type to file path
+	specFiles := map[string]string{
+		"mrd":              "source/mrd.md",
+		"opportunity-spec": "source/opportunity-spec.md",
+		"press":            "gtm/press.md",
+		"faq":              "gtm/faq.md",
+		"narrative-1p":     "gtm/narrative-1p.md",
+		"narrative-6p":     "gtm/narrative-6p.md",
+		"prd":              "source/prd.md",
+		"uxd":              "source/uxd.md",
+		"trd":              "technical/trd.md",
+		"tpd":              "technical/tpd.md",
+		"ird":              "technical/ird.md",
+		"spec":             "spec.md",
+	}
+	relPath, ok := specFiles[specType]
+	if !ok {
+		relPath = fmt.Sprintf("specs/%s.md", specType)
+	}
+
+	// Read spec content (specType validated above)
+	specPath := filepath.Join(project.Path, relPath) //nolint:gosec
+	content, err := os.ReadFile(specPath)            //nolint:gosec
+	if err != nil {
+		s.writeJSON(w, http.StatusNotFound, api.EvaluateSpecResponse{
+			Error: fmt.Sprintf("Spec file not found: %s", relPath),
+		})
+		return
+	}
+
+	// Use project LLM config if available, otherwise fall back to env vars
+	var projectLLMConfig *types.LLMConfig
+	if projectState := s.loadProjectState(project.Path); projectState != nil {
+		projectLLMConfig = projectState.LLM
+	}
+
+	llmClient, err := visionspeceval.NewLLMClientFromProject(projectLLMConfig)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, api.EvaluateSpecResponse{
+			Error: fmt.Sprintf("LLM unavailable: %v — set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY", err),
+		})
+		return
+	}
+	defer llmClient.Close()
+
+	// Evaluate spec with LLM-as-a-Judge
+	evaluator := visionspeceval.NewEvaluator(llmClient)
+	result, err := evaluator.Evaluate(r.Context(), types.SpecType(specType), string(content))
+	if err != nil {
+		s.logger.Error("Evaluation failed", "project", projectName, "type", specType, "error", err)
+		s.writeJSON(w, http.StatusInternalServerError, api.EvaluateSpecResponse{
+			Error: fmt.Sprintf("Evaluation failed: %v", err),
+		})
+		return
+	}
+
+	// Convert findings to API type
+	findings := make([]api.Finding, len(result.Findings))
+	for i, f := range result.Findings {
+		msg := f.Title
+		if f.Description != "" {
+			msg += ": " + f.Description
+		}
+		findings[i] = api.Finding{
+			Category: f.Category,
+			Severity: f.Severity,
+			Message:  msg,
+		}
+	}
+
+	decision := api.EvalDecisionFail
+	if result.Passed {
+		decision = api.EvalDecisionPass
+	} else if result.Score >= 5.0 {
+		decision = api.EvalDecisionConditional
+	}
+
+	evalResult := api.EvalResult{
+		Score:    result.Score,
+		Decision: decision,
+		Findings: findings,
+	}
+
+	// Persist evaluation result to eval/{specType}.json (specType validated above)
+	evalDir := filepath.Join(project.Path, "eval")
+	if mkErr := os.MkdirAll(evalDir, 0755); mkErr == nil { //nolint:gosec
+		evalPath := filepath.Join(evalDir, specType+".json")      //nolint:gosec
+		if data, jsonErr := json.Marshal(evalResult); jsonErr == nil {
+			os.WriteFile(evalPath, data, 0o600) //nolint:gosec,errcheck
+		}
+	}
+
+	// Broadcast eval_complete event to SSE clients
+	s.broadcastEvent(projectName, api.FileEvent{
+		Type:      api.EventEvalComplete,
+		Project:   projectName,
+		SpecType:  specType,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data: map[string]any{
+			"score":    evalResult.Score,
+			"decision": string(evalResult.Decision),
 		},
 	})
+
+	s.logger.Info("Evaluated spec", "project", projectName, "type", specType,
+		"score", result.Score, "passed", result.Passed, "findings", len(result.Findings))
+	s.writeJSON(w, http.StatusOK, api.EvaluateSpecResponse{Result: evalResult})
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -747,12 +860,91 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Debug("Chat request", "message", req.Message)
+	s.logger.Debug("Chat request", "messageLen", len(req.Message))
 
-	// TODO: Integrate with omniagent LLM
-	s.writeJSON(w, http.StatusOK, api.ChatResponse{
-		Response: fmt.Sprintf("I received your message: %q. LLM integration coming soon!", req.Message),
+	client, model, err := newOmniLLMClient()
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, api.ChatResponse{
+			Error: fmt.Sprintf("LLM unavailable: %v — set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY", err),
+		})
+		return
+	}
+	defer client.Close()
+
+	const systemPrompt = `You are a product spec writing assistant for the VisionSpec methodology. You help product managers, engineers, and designers create high-quality product specifications:
+
+- MRD (Market Requirements Document): market opportunity and business case
+- PRD (Product Requirements Document): what to build
+- TRD (Technical Design Document): how to build it
+- UXD (User Experience Document): the user experience design
+- Press Release: working backwards from the customer announcement
+- FAQ: challenges and gaps in the product narrative
+
+Be specific, actionable, and concise. When reviewing spec content, give concrete, prioritized improvements.`
+
+	userContent := req.Message
+	if req.Context != "" {
+		userContent = fmt.Sprintf("Here is the current spec content:\n\n```markdown\n%s\n```\n\n%s", req.Context, req.Message)
+	}
+
+	maxTokens := 2048
+	temp := 0.7
+	resp, err := client.CreateChatCompletion(r.Context(), &omnillm.ChatCompletionRequest{
+		Model: model,
+		Messages: []omnillm.Message{
+			{Role: omnillm.RoleSystem, Content: systemPrompt},
+			{Role: omnillm.RoleUser, Content: userContent},
+		},
+		MaxTokens:   &maxTokens,
+		Temperature: &temp,
 	})
+	if err != nil {
+		s.logger.Error("Chat LLM error", "error", err)
+		s.writeJSON(w, http.StatusInternalServerError, api.ChatResponse{
+			Error: fmt.Sprintf("LLM error: %v", err),
+		})
+		return
+	}
+
+	if len(resp.Choices) == 0 {
+		s.writeJSON(w, http.StatusInternalServerError, api.ChatResponse{Error: "No response from LLM"})
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, api.ChatResponse{Response: resp.Choices[0].Message.Content})
+}
+
+// newOmniLLMClient creates an omnillm ChatClient from the first available API key in the environment.
+// It returns the client, the default model for that provider, and any error.
+func newOmniLLMClient() (*omnillm.ChatClient, string, error) {
+	type providerSpec struct {
+		name   omnillm.ProviderName
+		envVar string
+		model  string
+	}
+	candidates := []providerSpec{
+		{omnillm.ProviderNameAnthropic, "ANTHROPIC_API_KEY", omnillm.ModelClaudeSonnet4_6},
+		{omnillm.ProviderNameOpenAI, "OPENAI_API_KEY", omnillm.ModelGPT4o},
+		{omnillm.ProviderNameGemini, "GEMINI_API_KEY", omnillm.ModelGemini2_5Flash},
+	}
+
+	for _, p := range candidates {
+		apiKey := os.Getenv(p.envVar)
+		if apiKey == "" {
+			continue
+		}
+		client, err := omnillm.NewClient(omnillm.ClientConfig{
+			Providers: []omnillm.ProviderConfig{
+				{Provider: p.name, APIKey: apiKey},
+			},
+		})
+		if err != nil {
+			continue
+		}
+		return client, p.model, nil
+	}
+
+	return nil, "", errors.New("no API key found")
 }
 
 func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -892,44 +1084,121 @@ func (s *Server) handleGetWorkflowStatus(w http.ResponseWriter, r *http.Request)
 	projectName := chi.URLParam(r, "project")
 	s.logger.Debug("Getting workflow status", "project", projectName)
 
-	// TODO: Compute actual workflow status from project specs
-	// For now, return mock data based on the example project
-	specStatuses := map[string]string{
-		"mrd":          string(api.SpecStatusEvaluated),
-		"press":        string(api.SpecStatusEvaluated),
-		"faq":          string(api.SpecStatusEvaluated),
-		"narrative-6p": string(api.SpecStatusNotStarted),
-		"prd":          string(api.SpecStatusNotStarted),
-		"uxd":          string(api.SpecStatusNotStarted),
-		"trd":          string(api.SpecStatusNotStarted),
-		"tpd":          string(api.SpecStatusNotStarted),
+	// Get project from config
+	tracked, err := config.GetProject(projectName)
+	if err != nil {
+		s.writeJSON(w, http.StatusNotFound, api.GetWorkflowStatusResponse{
+			Error: err.Error(),
+		})
+		return
 	}
 
-	// Determine current phase based on spec statuses
-	currentPhase := "source"
+	// Load the profile to get the spec workflow
+	profile, err := profileLoader.Load(tracked.Profile)
+	if err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, api.GetWorkflowStatusResponse{
+			Error: fmt.Sprintf("failed to load profile: %v", err),
+		})
+		return
+	}
+
+	// Build spec status map from actual disk state
+	workflowSpecs := profile.RequiredSpecs()
+	specFiles := map[string]string{
+		"mrd":              "source/mrd.md",
+		"opportunity-spec": "source/opportunity-spec.md",
+		"press":            "gtm/press.md",
+		"faq":              "gtm/faq.md",
+		"narrative-1p":     "gtm/narrative-1p.md",
+		"narrative-6p":     "gtm/narrative-6p.md",
+		"prd":              "source/prd.md",
+		"uxd":              "source/uxd.md",
+		"trd":              "technical/trd.md",
+		"tpd":              "technical/tpd.md",
+		"ird":              "technical/ird.md",
+		"spec":             "spec.md",
+		"current-truth":    "current-truth.md",
+	}
+
+	specStatuses := make(map[string]string, len(workflowSpecs))
+	for _, st := range workflowSpecs {
+		relPath, ok := specFiles[st]
+		if !ok {
+			relPath = fmt.Sprintf("specs/%s.md", st)
+		}
+		specPath := filepath.Join(tracked.Path, relPath)
+		if _, err := os.Stat(specPath); err != nil {
+			specStatuses[st] = string(api.SpecStatusNotStarted)
+			continue
+		}
+		// File exists — check for eval result
+		evalPath := filepath.Join(tracked.Path, "eval", st+".json")
+		evalData, err := os.ReadFile(evalPath) //nolint:gosec
+		if err != nil {
+			specStatuses[st] = string(api.SpecStatusDraft)
+			continue
+		}
+		var evalResult api.EvalResult
+		if json.Unmarshal(evalData, &evalResult) != nil {
+			specStatuses[st] = string(api.SpecStatusDraft)
+			continue
+		}
+		if evalResult.Decision == api.EvalDecisionPass {
+			specStatuses[st] = string(api.SpecStatusApproved)
+		} else {
+			specStatuses[st] = string(api.SpecStatusEvaluated)
+		}
+	}
+
+	// Ordered phases with their associated spec types
+	phaseOrder := []struct {
+		id    string
+		specs []string
+	}{
+		{"source", []string{"mrd", "opportunity-spec"}},
+		{"gtm", []string{"press", "faq", "narrative-1p", "narrative-6p"}},
+		{"product", []string{"prd", "uxd"}},
+		{"technical", []string{"trd", "tpd", "ird"}},
+		{"reconcile", []string{"spec", "current-truth"}},
+	}
+
+	isDone := func(specType string) bool {
+		s := specStatuses[specType]
+		return s == string(api.SpecStatusEvaluated) || s == string(api.SpecStatusApproved)
+	}
+
+	currentPhase := phaseOrder[0].id
 	completedPhases := []string{}
 	blockedBy := []string{}
 
-	// Simple logic: if MRD is done, we're in GTM phase
-	if specStatuses["mrd"] == string(api.SpecStatusEvaluated) ||
-		specStatuses["mrd"] == string(api.SpecStatusApproved) {
-		completedPhases = append(completedPhases, "source")
-		currentPhase = "gtm"
+	for _, phase := range phaseOrder {
+		// Collect specs that are actually in this project's workflow
+		active := []string{}
+		for _, st := range phase.specs {
+			if _, inWorkflow := specStatuses[st]; inWorkflow {
+				active = append(active, st)
+			}
+		}
+		if len(active) == 0 {
+			continue
+		}
+		// Check if all active specs in this phase are done
+		allDone := true
+		for _, st := range active {
+			if !isDone(st) {
+				allDone = false
+				blockedBy = append(blockedBy, st)
+			}
+		}
+		if allDone {
+			completedPhases = append(completedPhases, phase.id)
+		} else {
+			currentPhase = phase.id
+			break
+		}
 	}
 
-	// If GTM specs are done, we're in product phase
-	gtmDone := (specStatuses["press"] == string(api.SpecStatusEvaluated) ||
-		specStatuses["press"] == string(api.SpecStatusApproved)) &&
-		(specStatuses["faq"] == string(api.SpecStatusEvaluated) ||
-			specStatuses["faq"] == string(api.SpecStatusApproved))
-
-	if gtmDone {
-		completedPhases = append(completedPhases, "gtm")
-		currentPhase = "product"
-		blockedBy = []string{"narrative-6p"}
-	}
-
-	// Calculate progress
+	// Progress = fraction of specs that are evaluated or approved
 	totalSpecs := len(specStatuses)
 	completedSpecs := 0
 	for _, status := range specStatuses {
@@ -937,7 +1206,10 @@ func (s *Server) handleGetWorkflowStatus(w http.ResponseWriter, r *http.Request)
 			completedSpecs++
 		}
 	}
-	progress := float64(completedSpecs) / float64(totalSpecs)
+	progress := 0.0
+	if totalSpecs > 0 {
+		progress = float64(completedSpecs) / float64(totalSpecs)
+	}
 
 	s.writeJSON(w, http.StatusOK, api.GetWorkflowStatusResponse{
 		Status: api.WorkflowStatus{
